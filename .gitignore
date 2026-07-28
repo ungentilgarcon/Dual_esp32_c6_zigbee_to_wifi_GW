@@ -1,0 +1,11 @@
+# ESP-IDF / firmware build artifacts
+**/build/
+**/managed_components/
+**/sdkconfig*
+**/dependencies.lock
+
+# Editor / OS noise
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
