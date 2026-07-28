@@ -84,6 +84,13 @@ Edit these fields:
 
 After changing the file, rebuild and reflash the Wi-Fi bridge so the SPIFFS image updates.
 
+If the JSON still contains placeholders on first boot, the bridge starts a setup AP:
+
+- SSID: `GW-SETUP-XXXXXX`
+- password: `configure123`
+
+Open `http://192.168.4.1/` to save the Wi-Fi and MQTT settings, then it reboots and joins your network.
+
 ## Self-test routine
 
 Use this to check the full UART + MQTT loop before real TRVs are added:

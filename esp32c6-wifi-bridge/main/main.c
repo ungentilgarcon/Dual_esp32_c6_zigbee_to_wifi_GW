@@ -8,17 +8,27 @@
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_http_server.h"
 #include "esp_netif.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_spiffs.h"
+#include "esp_mac.h"
 #include "mqtt_client.h"
 #include "nvs_flash.h"
 #include "cJSON.h"
+#include "freertos/event_groups.h"
 
 #include "bridge_config.h"
 
 static const char *TAG = "WIFI_BRIDGE";
 static esp_mqtt_client_handle_t s_mqtt = NULL;
+static httpd_handle_t s_http = NULL;
+static EventGroupHandle_t s_provision_event_group = NULL;
+
+#define PROVISION_DONE_BIT BIT0
+#define BRIDGE_PROVISION_AP_PASS "configure123"
+
 typedef struct {
     char wifi_ssid[33];
     char wifi_pass[65];
@@ -55,6 +65,19 @@ static void load_default_config(void) {
     snprintf(s_cfg.wifi_pass, sizeof(s_cfg.wifi_pass), "%s", BRIDGE_WIFI_PASS);
     snprintf(s_cfg.mqtt_uri, sizeof(s_cfg.mqtt_uri), "%s", BRIDGE_MQTT_URI);
     snprintf(s_cfg.mqtt_base_topic, sizeof(s_cfg.mqtt_base_topic), "%s", BRIDGE_MQTT_BASE_TOPIC);
+}
+
+static bool is_placeholder_string(const char *value)
+{
+    return value == NULL || value[0] == '\0' || strncmp(value, "YOUR_", 5) == 0;
+}
+
+static bool bridge_config_is_valid(void)
+{
+    return !is_placeholder_string(s_cfg.wifi_ssid) &&
+           !is_placeholder_string(s_cfg.wifi_pass) &&
+           !is_placeholder_string(s_cfg.mqtt_uri) &&
+           !is_placeholder_string(s_cfg.mqtt_base_topic);
 }
 
 static void mount_spiffs(void) {
@@ -141,6 +164,244 @@ static void load_bridge_config(void) {
     ESP_LOGI(TAG, "Loaded Wi-Fi config from %s", BRIDGE_CONFIG_PATH);
 }
 
+static esp_err_t save_bridge_config_file(const char *ssid, const char *password, const char *mqtt_uri, const char *mqtt_base_topic)
+{
+    cJSON *root = cJSON_CreateObject();
+    char *encoded;
+    FILE *fp;
+    esp_err_t ret = ESP_OK;
+
+    if (root == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddStringToObject(root, "wifi_ssid", ssid);
+    cJSON_AddStringToObject(root, "wifi_password", password);
+    cJSON_AddStringToObject(root, "mqtt_uri", mqtt_uri);
+    cJSON_AddStringToObject(root, "mqtt_base_topic", mqtt_base_topic);
+
+    encoded = cJSON_PrintUnformatted(root);
+    if (encoded == NULL) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    fp = fopen(BRIDGE_CONFIG_PATH, "wb");
+    if (fp == NULL) {
+        cJSON_free(encoded);
+        cJSON_Delete(root);
+        return ESP_FAIL;
+    }
+
+    if (fwrite(encoded, 1, strlen(encoded), fp) != strlen(encoded)) {
+        ret = ESP_FAIL;
+    }
+
+    fclose(fp);
+    cJSON_free(encoded);
+    cJSON_Delete(root);
+    return ret;
+}
+
+static void configure_wifi_station_from_config(void)
+{
+    wifi_config_t wifi_cfg = {0};
+    strncpy((char *)wifi_cfg.sta.ssid, s_cfg.wifi_ssid, sizeof(wifi_cfg.sta.ssid) - 1);
+    strncpy((char *)wifi_cfg.sta.password, s_cfg.wifi_pass, sizeof(wifi_cfg.sta.password) - 1);
+    wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+static void wifi_provisioning_start_ap(void)
+{
+    uint8_t mac[6] = {0};
+    wifi_config_t ap_cfg = {0};
+    char ssid[32];
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+
+    ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP));
+    snprintf(ssid, sizeof(ssid), "GW-SETUP-%02X%02X%02X", mac[3], mac[4], mac[5]);
+    snprintf((char *)ap_cfg.ap.ssid, sizeof(ap_cfg.ap.ssid), "%s", ssid);
+    snprintf((char *)ap_cfg.ap.password, sizeof(ap_cfg.ap.password), "%s", BRIDGE_PROVISION_AP_PASS);
+    ap_cfg.ap.ssid_len = strlen(ssid);
+    ap_cfg.ap.channel = 1;
+    ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    ap_cfg.ap.max_connection = 4;
+    ap_cfg.ap.beacon_interval = 100;
+    if (strlen(BRIDGE_PROVISION_AP_PASS) == 0) {
+        ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGW(TAG, "Provisioning AP started: SSID=%s PASS=%s", ssid, BRIDGE_PROVISION_AP_PASS);
+}
+
+static esp_err_t provision_root_get_handler(httpd_req_t *req)
+{
+    const char html[] =
+        "<!doctype html><html><body>"
+        "<h1>Gateway setup</h1>"
+        "<form id='cfg'>"
+        "Wi-Fi SSID:<br><input name='wifi_ssid'><br>"
+        "Wi-Fi password:<br><input name='wifi_password' type='password'><br>"
+        "MQTT URI:<br><input name='mqtt_uri' value='mqtt://192.168.1.10:1883'><br>"
+        "MQTT topic base:<br><input name='mqtt_base_topic' value='zigbee2mqtt'><br>"
+        "<button type='button' onclick=\"fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({wifi_ssid:document.querySelector('[name=wifi_ssid]').value,wifi_password:document.querySelector('[name=wifi_password]').value,mqtt_uri:document.querySelector('[name=mqtt_uri]').value,mqtt_base_topic:document.querySelector('[name=mqtt_base_topic]').value})}).then(r=>r.text()).then(t=>document.body.innerHTML='<pre>'+t+'</pre>')\">Save</button></form>"
+        "</body></html>";
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t provision_config_get_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    char *json;
+    esp_err_t ret;
+
+    if (root == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddStringToObject(root, "wifi_ssid", s_cfg.wifi_ssid);
+    cJSON_AddStringToObject(root, "mqtt_uri", s_cfg.mqtt_uri);
+    cJSON_AddStringToObject(root, "mqtt_base_topic", s_cfg.mqtt_base_topic);
+    json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (json == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    ret = httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+    cJSON_free(json);
+    return ret;
+}
+
+static esp_err_t provision_save_post_handler(httpd_req_t *req)
+{
+    char buf[512];
+    int remaining = req->content_len;
+    int received = 0;
+    cJSON *root;
+    const char *ssid;
+    const char *password;
+    const char *mqtt_uri;
+    const char *mqtt_base_topic;
+
+    if (remaining <= 0 || remaining >= (int)sizeof(buf)) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body size");
+    }
+
+    while (remaining > 0) {
+        int chunk = httpd_req_recv(req, buf + received, remaining);
+        if (chunk <= 0) {
+            return ESP_FAIL;
+        }
+        received += chunk;
+        remaining -= chunk;
+    }
+    buf[received] = '\0';
+
+    root = cJSON_Parse(buf);
+    if (root == NULL) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    }
+
+    ssid = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(root, "wifi_ssid"));
+    password = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(root, "wifi_password"));
+    mqtt_uri = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(root, "mqtt_uri"));
+    mqtt_base_topic = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(root, "mqtt_base_topic"));
+
+    if (ssid == NULL || password == NULL || mqtt_uri == NULL || mqtt_base_topic == NULL) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing fields");
+    }
+
+    if (save_bridge_config_file(ssid, password, mqtt_uri, mqtt_base_topic) != ESP_OK) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Save failed");
+    }
+
+    snprintf(s_cfg.wifi_ssid, sizeof(s_cfg.wifi_ssid), "%s", ssid);
+    snprintf(s_cfg.wifi_pass, sizeof(s_cfg.wifi_pass), "%s", password);
+    snprintf(s_cfg.mqtt_uri, sizeof(s_cfg.mqtt_uri), "%s", mqtt_uri);
+    snprintf(s_cfg.mqtt_base_topic, sizeof(s_cfg.mqtt_base_topic), "%s", mqtt_base_topic);
+    cJSON_Delete(root);
+
+    if (s_provision_event_group != NULL) {
+        xEventGroupSetBits(s_provision_event_group, PROVISION_DONE_BIT);
+    }
+
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, "saved; rebooting");
+}
+
+static httpd_handle_t start_provisioning_server(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_handle_t server = NULL;
+    httpd_uri_t root_uri = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = provision_root_get_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t config_uri = {
+        .uri = "/config",
+        .method = HTTP_GET,
+        .handler = provision_config_get_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t save_uri = {
+        .uri = "/save",
+        .method = HTTP_POST,
+        .handler = provision_save_post_handler,
+        .user_ctx = NULL,
+    };
+
+    if (httpd_start(&server, &config) != ESP_OK) {
+        return NULL;
+    }
+
+    httpd_register_uri_handler(server, &root_uri);
+    httpd_register_uri_handler(server, &config_uri);
+    httpd_register_uri_handler(server, &save_uri);
+    return server;
+}
+
+static void provisioning_mode(void)
+{
+    wifi_provisioning_start_ap();
+    s_http = start_provisioning_server();
+    if (s_http == NULL) {
+        ESP_LOGE(TAG, "Failed to start provisioning server");
+        return;
+    }
+
+    ESP_LOGW(TAG, "Open http://192.168.4.1/ to configure Wi-Fi and MQTT");
+    if (s_provision_event_group == NULL) {
+        s_provision_event_group = xEventGroupCreate();
+    }
+    xEventGroupWaitBits(s_provision_event_group, PROVISION_DONE_BIT, pdTRUE, pdFALSE, portMAX_DELAY);
+    if (s_http != NULL) {
+        httpd_stop(s_http);
+        s_http = NULL;
+    }
+    esp_restart();
+}
+
 static void uart_init(void) {
     const uart_config_t cfg = {
         .baud_rate = BRIDGE_UART_BAUDRATE,
@@ -183,15 +444,7 @@ static void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
-
-    wifi_config_t wifi_cfg = {0};
-    strncpy((char *)wifi_cfg.sta.ssid, s_cfg.wifi_ssid, sizeof(wifi_cfg.sta.ssid) - 1);
-    strncpy((char *)wifi_cfg.sta.password, s_cfg.wifi_pass, sizeof(wifi_cfg.sta.password) - 1);
-    wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    configure_wifi_station_from_config();
 }
 
 static void uart_write_line(const char *line) {
@@ -525,6 +778,10 @@ void app_main(void) {
     ESP_ERROR_CHECK(err);
     uart_init();
     load_bridge_config();
+    if (!bridge_config_is_valid()) {
+        provisioning_mode();
+        return;
+    }
     wifi_init_sta();
     mqtt_start();
     xTaskCreate(uart_rx_task, "uart_rx_task", 6144, NULL, 5, NULL);
