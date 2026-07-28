@@ -5,6 +5,11 @@ This repository gives you a **working starter architecture** for a dual ESP32-C6
 - **Board A (Zigbee side)**: real Zigbee coordinator firmware exposing TRV telemetry and actions over UART JSON lines.
 - **Board B (Wi-Fi side)**: MQTT bridge firmware publishing/subscribing with Zigbee2MQTT-compatible topic patterns so systems like **THERMOCALC** can interact in/out.
 
+Start here:
+
+- [Full guide](C:/Users/GBAH/Documents/Dual_esp32_c6_zigbee_to_wifi_GW/docs/guide.md)
+- [Reference sheet](C:/Users/GBAH/Documents/Dual_esp32_c6_zigbee_to_wifi_GW/docs/reference.md)
+
 ## Why this architecture
 
 For ESP32-C6, Zigbee + Wi-Fi can run on one chip but RX concurrency is limited. Espressif examples recommend a dual-SoC architecture for reliability/performance.
