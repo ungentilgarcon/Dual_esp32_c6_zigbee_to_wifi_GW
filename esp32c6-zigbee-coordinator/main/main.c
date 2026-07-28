@@ -49,7 +49,7 @@ static coord_device_t *registry_lookup(const char *friendly_name);
 static void registry_store(uint16_t short_addr, uint8_t ep, const char *manufacturer, const char *model);
 static ezb_err_t write_thermostat_setpoint(uint16_t short_addr, uint8_t ep, float setpoint_c);
 static ezb_err_t write_thermostat_system_mode(uint16_t short_addr, uint8_t ep, uint8_t system_mode);
-static ezb_err_t write_thermostat_preset(uint16_t short_addr, uint8_t ep, const char *preset);
+static ezb_err_t write_thermostat_preset_for_device(const char *model, uint16_t short_addr, uint8_t ep, const char *preset);
 static void sanitize_name_component(const char *src, char *dst, size_t dst_size);
 static const char *thermostat_system_mode_name(uint8_t mode);
 
@@ -412,7 +412,7 @@ static void handle_set_command(const cJSON *json)
         if (cJSON_HasObjectItem(payload, "preset")) {
             const cJSON *preset = cJSON_GetObjectItemCaseSensitive(payload, "preset");
             if (cJSON_IsString(preset) && preset->valuestring != NULL) {
-                ezb_err_t ret = write_thermostat_preset(short_addr, ep, preset->valuestring);
+                ezb_err_t ret = write_thermostat_preset_for_device(device != NULL ? device->model : NULL, short_addr, ep, preset->valuestring);
                 ESP_LOGI(TAG, "Write preset %s to 0x%04hx/ep%u -> 0x%04x", preset->valuestring, short_addr, ep, ret);
             }
         }
@@ -618,14 +618,35 @@ static ezb_err_t write_thermostat_system_mode(uint16_t short_addr, uint8_t ep, u
     return write_thermostat_attr_short(short_addr, ep, 0x001C, EZB_ZCL_ATTR_TYPE_UINT8, &system_mode);
 }
 
-static ezb_err_t write_thermostat_preset(uint16_t short_addr, uint8_t ep, const char *preset)
+static ezb_err_t write_thermostat_preset_for_device(const char *model, uint16_t short_addr, uint8_t ep, const char *preset)
 {
     uint8_t mode = 0x04;
 
     if (preset == NULL) {
         return EZB_ERR_FAIL;
     }
-    if (strcmp(preset, "off") == 0 || strcmp(preset, "away") == 0 || strcmp(preset, "eco") == 0) {
+
+    if (model != NULL && strcmp(model, "trv701z") == 0) {
+        if (strcmp(preset, "off") == 0 || strcmp(preset, "away") == 0 || strcmp(preset, "holiday") == 0) {
+            mode = 0x00;
+        } else if (strcmp(preset, "eco") == 0 || strcmp(preset, "auto") == 0 || strcmp(preset, "schedule") == 0 ||
+                   strcmp(preset, "program") == 0) {
+            mode = 0x01;
+        } else if (strcmp(preset, "manual") == 0 || strcmp(preset, "comfort") == 0 || strcmp(preset, "boost") == 0 ||
+                   strcmp(preset, "heat") == 0) {
+            mode = 0x04;
+        } else if (strcmp(preset, "sleep") == 0) {
+            mode = 0x09;
+        } else if (strcmp(preset, "cool") == 0) {
+            mode = 0x03;
+        } else if (strcmp(preset, "fan_only") == 0) {
+            mode = 0x07;
+        } else if (strcmp(preset, "dry") == 0) {
+            mode = 0x08;
+        } else {
+            return EZB_ERR_FAIL;
+        }
+    } else if (strcmp(preset, "off") == 0 || strcmp(preset, "away") == 0 || strcmp(preset, "eco") == 0) {
         mode = 0x00;
     } else if (strcmp(preset, "auto") == 0 || strcmp(preset, "schedule") == 0 || strcmp(preset, "comfort") == 0 ||
                strcmp(preset, "boost") == 0 || strcmp(preset, "heat") == 0) {

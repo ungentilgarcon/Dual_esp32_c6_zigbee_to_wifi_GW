@@ -132,6 +132,8 @@ The coordinator already uses the real Zigbee stack now. Next refinements are:
 - tune any vendor-specific preset mapping for your exact TRV model
 - add a richer device registry if your device names differ from `trv_XXXX`
 
+Current preset tuning includes a TRV701Z-specific profile.
+
 ## Legal note
 
 This implementation is original code written for your project, inspired by public architecture patterns from the referenced repositories (not a direct code copy).
