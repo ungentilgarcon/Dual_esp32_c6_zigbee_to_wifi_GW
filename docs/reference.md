@@ -17,6 +17,15 @@ Schema:
 }
 ```
 
+## Provisioning AP
+
+If Wi-Fi settings are missing on first boot, the bridge starts a setup AP:
+
+- SSID: `GW-SETUP-XXXXXX`
+- password: `configure123`
+
+Open `http://192.168.4.1/` to save the settings.
+
 ## UART frame types
 
 See:
@@ -77,4 +86,3 @@ The coordinator emits:
 - battery voltage
 - humidity
 - pi heating demand
-
