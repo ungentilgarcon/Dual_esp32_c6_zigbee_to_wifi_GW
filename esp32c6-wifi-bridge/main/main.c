@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -9,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_spiffs.h"
 #include "mqtt_client.h"
 #include "nvs_flash.h"
 #include "cJSON.h"
@@ -17,6 +19,127 @@
 
 static const char *TAG = "WIFI_BRIDGE";
 static esp_mqtt_client_handle_t s_mqtt = NULL;
+typedef struct {
+    char wifi_ssid[33];
+    char wifi_pass[65];
+    char mqtt_uri[128];
+    char mqtt_base_topic[64];
+} bridge_runtime_config_t;
+
+static bridge_runtime_config_t s_cfg = {
+    .wifi_ssid = BRIDGE_WIFI_SSID,
+    .wifi_pass = BRIDGE_WIFI_PASS,
+    .mqtt_uri = BRIDGE_MQTT_URI,
+    .mqtt_base_topic = BRIDGE_MQTT_BASE_TOPIC,
+};
+
+static bool copy_json_string_field(cJSON *root, const char *field, char *dst, size_t dst_size) {
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, field);
+    int written;
+
+    if (!cJSON_IsString(item) || item->valuestring == NULL) {
+        return false;
+    }
+
+    written = snprintf(dst, dst_size, "%s", item->valuestring);
+    if (written < 0 || written >= (int)dst_size) {
+        ESP_LOGW(TAG, "Config field %s is too long", field);
+        return false;
+    }
+
+    return true;
+}
+
+static void load_default_config(void) {
+    snprintf(s_cfg.wifi_ssid, sizeof(s_cfg.wifi_ssid), "%s", BRIDGE_WIFI_SSID);
+    snprintf(s_cfg.wifi_pass, sizeof(s_cfg.wifi_pass), "%s", BRIDGE_WIFI_PASS);
+    snprintf(s_cfg.mqtt_uri, sizeof(s_cfg.mqtt_uri), "%s", BRIDGE_MQTT_URI);
+    snprintf(s_cfg.mqtt_base_topic, sizeof(s_cfg.mqtt_base_topic), "%s", BRIDGE_MQTT_BASE_TOPIC);
+}
+
+static void mount_spiffs(void) {
+    const esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = "storage",
+        .max_files = 4,
+        .format_if_mount_failed = false,
+    };
+    size_t total = 0;
+    size_t used = 0;
+
+    ESP_ERROR_CHECK(esp_vfs_spiffs_register(&conf));
+    ESP_ERROR_CHECK(esp_spiffs_info(conf.partition_label, &total, &used));
+    ESP_LOGI(TAG, "SPIFFS mounted: total=%u used=%u", (unsigned)total, (unsigned)used);
+}
+
+static void load_bridge_config(void) {
+    FILE *fp;
+    long file_size;
+    char *buffer;
+    cJSON *root;
+
+    load_default_config();
+    mount_spiffs();
+
+    fp = fopen(BRIDGE_CONFIG_PATH, "rb");
+    if (fp == NULL) {
+        ESP_LOGW(TAG, "Config file %s not found, using defaults", BRIDGE_CONFIG_PATH);
+        return;
+    }
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        ESP_LOGW(TAG, "Failed to seek config file");
+        fclose(fp);
+        return;
+    }
+
+    file_size = ftell(fp);
+    if (file_size <= 0 || file_size > 4096) {
+        ESP_LOGW(TAG, "Config file size is invalid");
+        fclose(fp);
+        return;
+    }
+
+    if (fseek(fp, 0, SEEK_SET) != 0) {
+        ESP_LOGW(TAG, "Failed to rewind config file");
+        fclose(fp);
+        return;
+    }
+
+    buffer = malloc((size_t)file_size + 1U);
+    if (buffer == NULL) {
+        ESP_LOGW(TAG, "Out of memory loading config file");
+        fclose(fp);
+        return;
+    }
+
+    if (fread(buffer, 1, (size_t)file_size, fp) != (size_t)file_size) {
+        ESP_LOGW(TAG, "Failed to read config file");
+        free(buffer);
+        fclose(fp);
+        return;
+    }
+    buffer[file_size] = '\0';
+    fclose(fp);
+
+    root = cJSON_Parse(buffer);
+    free(buffer);
+    if (root == NULL || !cJSON_IsObject(root)) {
+        ESP_LOGW(TAG, "Invalid JSON in %s", BRIDGE_CONFIG_PATH);
+        if (root != NULL) {
+            cJSON_Delete(root);
+        }
+        return;
+    }
+
+    copy_json_string_field(root, "wifi_ssid", s_cfg.wifi_ssid, sizeof(s_cfg.wifi_ssid));
+    copy_json_string_field(root, "wifi_password", s_cfg.wifi_pass, sizeof(s_cfg.wifi_pass));
+    copy_json_string_field(root, "mqtt_uri", s_cfg.mqtt_uri, sizeof(s_cfg.mqtt_uri));
+    copy_json_string_field(root, "mqtt_base_topic", s_cfg.mqtt_base_topic, sizeof(s_cfg.mqtt_base_topic));
+    cJSON_Delete(root);
+
+    ESP_LOGI(TAG, "Loaded Wi-Fi config from %s", BRIDGE_CONFIG_PATH);
+}
 
 static void uart_init(void) {
     const uart_config_t cfg = {
@@ -62,8 +185,8 @@ static void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
 
     wifi_config_t wifi_cfg = {0};
-    strncpy((char *)wifi_cfg.sta.ssid, BRIDGE_WIFI_SSID, sizeof(wifi_cfg.sta.ssid) - 1);
-    strncpy((char *)wifi_cfg.sta.password, BRIDGE_WIFI_PASS, sizeof(wifi_cfg.sta.password) - 1);
+    strncpy((char *)wifi_cfg.sta.ssid, s_cfg.wifi_ssid, sizeof(wifi_cfg.sta.ssid) - 1);
+    strncpy((char *)wifi_cfg.sta.password, s_cfg.wifi_pass, sizeof(wifi_cfg.sta.password) - 1);
     wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -77,14 +200,14 @@ static void uart_write_line(const char *line) {
 }
 
 static void forward_set_command_to_uart(const char *topic, const char *payload, int payload_len) {
-    const size_t prefix_len = strlen(BRIDGE_MQTT_BASE_TOPIC) + 1;
+    const size_t prefix_len = strlen(s_cfg.mqtt_base_topic) + 1;
     const size_t topic_len = strlen(topic);
     const char suffix[] = "/set";
 
     if (topic_len <= prefix_len + strlen(suffix)) {
         return;
     }
-    if (strncmp(topic, BRIDGE_MQTT_BASE_TOPIC, strlen(BRIDGE_MQTT_BASE_TOPIC)) != 0 || topic[strlen(BRIDGE_MQTT_BASE_TOPIC)] != '/') {
+    if (strncmp(topic, s_cfg.mqtt_base_topic, strlen(s_cfg.mqtt_base_topic)) != 0 || topic[strlen(s_cfg.mqtt_base_topic)] != '/') {
         return;
     }
     if (strcmp(topic + topic_len - strlen(suffix), suffix) != 0) {
@@ -138,11 +261,11 @@ static void forward_set_command_to_uart(const char *topic, const char *payload, 
 }
 
 static void forward_test_command_to_uart(const char *topic, const char *payload, int payload_len) {
-    const size_t prefix_len = strlen(BRIDGE_MQTT_BASE_TOPIC) + 1;
+    const size_t prefix_len = strlen(s_cfg.mqtt_base_topic) + 1;
     const char suffix[] = "/set";
     const size_t topic_len = strlen(topic);
 
-    if (strncmp(topic, BRIDGE_MQTT_BASE_TOPIC, strlen(BRIDGE_MQTT_BASE_TOPIC)) != 0 || topic[strlen(BRIDGE_MQTT_BASE_TOPIC)] != '/') {
+    if (strncmp(topic, s_cfg.mqtt_base_topic, strlen(s_cfg.mqtt_base_topic)) != 0 || topic[strlen(s_cfg.mqtt_base_topic)] != '/') {
         return;
     }
     if (topic_len <= prefix_len + strlen(suffix)) {
@@ -238,7 +361,7 @@ static void forward_mode_command_to_uart(const char *payload, int payload_len) {
 
 static int topic_is_gateway_control_set(const char *topic) {
     char expected[128];
-    snprintf(expected, sizeof(expected), "%s/gateway_control/set", BRIDGE_MQTT_BASE_TOPIC);
+    snprintf(expected, sizeof(expected), "%s/gateway_control/set", s_cfg.mqtt_base_topic);
     return strcmp(topic, expected) == 0;
 }
 
@@ -249,7 +372,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
     if (event_id == MQTT_EVENT_CONNECTED) {
         char topic[128];
-        snprintf(topic, sizeof(topic), "%s/+/set", BRIDGE_MQTT_BASE_TOPIC);
+        snprintf(topic, sizeof(topic), "%s/+/set", s_cfg.mqtt_base_topic);
         esp_mqtt_client_subscribe(s_mqtt, topic, 1);
         ESP_LOGI(TAG, "MQTT connected and subscribed to %s", topic);
         return;
@@ -277,7 +400,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
 static void mqtt_start(void) {
     const esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = BRIDGE_MQTT_URI,
+        .broker.address.uri = s_cfg.mqtt_uri,
     };
 
     s_mqtt = esp_mqtt_client_init(&mqtt_cfg);
@@ -301,7 +424,7 @@ static void publish_uart_telemetry_to_mqtt(const char *line) {
 
     if (strcmp(type->valuestring, "trv_telemetry") == 0 && cJSON_IsString(friendly_name) && friendly_name->valuestring != NULL) {
         char topic[192];
-        snprintf(topic, sizeof(topic), "%s/%s", BRIDGE_MQTT_BASE_TOPIC, friendly_name->valuestring);
+        snprintf(topic, sizeof(topic), "%s/%s", s_cfg.mqtt_base_topic, friendly_name->valuestring);
 
         cJSON_DeleteItemFromObjectCaseSensitive(root, "type");
         char *payload = cJSON_PrintUnformatted(root);
@@ -312,7 +435,7 @@ static void publish_uart_telemetry_to_mqtt(const char *line) {
         }
     } else if (strcmp(type->valuestring, "test_result") == 0 && cJSON_IsString(friendly_name) && friendly_name->valuestring != NULL) {
         char topic[192];
-        snprintf(topic, sizeof(topic), "%s/%s/result", BRIDGE_MQTT_BASE_TOPIC, friendly_name->valuestring);
+        snprintf(topic, sizeof(topic), "%s/%s/result", s_cfg.mqtt_base_topic, friendly_name->valuestring);
         char *payload = cJSON_PrintUnformatted(root);
         if (payload != NULL) {
             esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 0);
@@ -321,7 +444,7 @@ static void publish_uart_telemetry_to_mqtt(const char *line) {
         }
     } else if (strcmp(type->valuestring, "test_event") == 0 && cJSON_IsString(friendly_name) && friendly_name->valuestring != NULL) {
         char topic[192];
-        snprintf(topic, sizeof(topic), "%s/%s/event", BRIDGE_MQTT_BASE_TOPIC, friendly_name->valuestring);
+        snprintf(topic, sizeof(topic), "%s/%s/event", s_cfg.mqtt_base_topic, friendly_name->valuestring);
         char *payload = cJSON_PrintUnformatted(root);
         if (payload != NULL) {
             esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 0);
@@ -330,7 +453,7 @@ static void publish_uart_telemetry_to_mqtt(const char *line) {
         }
     } else if (strcmp(type->valuestring, "mode_status") == 0 && cJSON_IsString(friendly_name) && friendly_name->valuestring != NULL) {
         char topic[192];
-        snprintf(topic, sizeof(topic), "%s/%s/status", BRIDGE_MQTT_BASE_TOPIC, friendly_name->valuestring);
+        snprintf(topic, sizeof(topic), "%s/%s/status", s_cfg.mqtt_base_topic, friendly_name->valuestring);
         char *payload = cJSON_PrintUnformatted(root);
         if (payload != NULL) {
             esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 0);
@@ -339,7 +462,7 @@ static void publish_uart_telemetry_to_mqtt(const char *line) {
         }
     } else if (strcmp(type->valuestring, "zigbee_event") == 0 && cJSON_IsString(friendly_name) && friendly_name->valuestring != NULL) {
         char topic[192];
-        snprintf(topic, sizeof(topic), "%s/bridge/event", BRIDGE_MQTT_BASE_TOPIC);
+        snprintf(topic, sizeof(topic), "%s/bridge/event", s_cfg.mqtt_base_topic);
         char *payload = cJSON_PrintUnformatted(root);
         if (payload != NULL) {
             esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 0);
@@ -350,7 +473,7 @@ static void publish_uart_telemetry_to_mqtt(const char *line) {
         char *payload = cJSON_PrintUnformatted(root);
         if (payload != NULL) {
             char topic[192];
-            snprintf(topic, sizeof(topic), "%s/bridge/event", BRIDGE_MQTT_BASE_TOPIC);
+            snprintf(topic, sizeof(topic), "%s/bridge/event", s_cfg.mqtt_base_topic);
             esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 0);
             cJSON_free(payload);
         }
@@ -401,6 +524,7 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(err);
     uart_init();
+    load_bridge_config();
     wifi_init_sta();
     mqtt_start();
     xTaskCreate(uart_rx_task, "uart_rx_task", 6144, NULL, 5, NULL);

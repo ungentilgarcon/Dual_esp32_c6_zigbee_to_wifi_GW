@@ -69,6 +69,21 @@ For each app:
 3. `idf.py build`
 4. `idf.py -p <PORT> flash monitor`
 
+## Wi-Fi / MQTT configuration
+
+The Wi-Fi bridge reads its runtime settings from a JSON file stored in SPIFFS:
+
+- [esp32c6-wifi-bridge/spiffs/bridge_config.json](/C:/Users/GBAH/Documents/Dual_esp32_c6_zigbee_to_wifi_GW/esp32c6-wifi-bridge/spiffs/bridge_config.json)
+
+Edit these fields:
+
+- `wifi_ssid`
+- `wifi_password`
+- `mqtt_uri`
+- `mqtt_base_topic`
+
+After changing the file, rebuild and reflash the Wi-Fi bridge so the SPIFFS image updates.
+
 ## Self-test routine
 
 Use this to check the full UART + MQTT loop before real TRVs are added:
