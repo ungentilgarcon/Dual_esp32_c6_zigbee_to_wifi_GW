@@ -29,6 +29,9 @@ static volatile int s_test_mode = 0;
 typedef struct {
     bool in_use;
     char friendly_name[24];
+    char alias_name[80];
+    char manufacturer[32];
+    char model[32];
     uint16_t short_addr;
     uint8_t ep;
 } coord_device_t;
@@ -43,10 +46,12 @@ static void zdo_bind_discovery_result(const ezb_zdp_bind_req_result_t *result, v
 static void discover_device(uint16_t short_addr);
 static bool parse_trv_short_addr(const char *friendly_name, uint16_t *short_addr);
 static coord_device_t *registry_lookup(const char *friendly_name);
-static void registry_store(uint16_t short_addr, uint8_t ep);
+static void registry_store(uint16_t short_addr, uint8_t ep, const char *manufacturer, const char *model);
 static ezb_err_t write_thermostat_setpoint(uint16_t short_addr, uint8_t ep, float setpoint_c);
 static ezb_err_t write_thermostat_system_mode(uint16_t short_addr, uint8_t ep, uint8_t system_mode);
 static ezb_err_t write_thermostat_preset(uint16_t short_addr, uint8_t ep, const char *preset);
+static void sanitize_name_component(const char *src, char *dst, size_t dst_size);
+static const char *thermostat_system_mode_name(uint8_t mode);
 
 static void uart_init(void)
 {
@@ -89,22 +94,52 @@ static coord_device_t *registry_lookup(const char *friendly_name)
 {
     size_t i;
     for (i = 0; i < sizeof(s_devices) / sizeof(s_devices[0]); i++) {
-        if (s_devices[i].in_use && strcmp(s_devices[i].friendly_name, friendly_name) == 0) {
+        if (!s_devices[i].in_use) {
+            continue;
+        }
+        if (strcmp(s_devices[i].friendly_name, friendly_name) == 0 ||
+            (s_devices[i].alias_name[0] != '\0' && strcmp(s_devices[i].alias_name, friendly_name) == 0) ||
+            (s_devices[i].manufacturer[0] != '\0' && strcmp(s_devices[i].manufacturer, friendly_name) == 0) ||
+            (s_devices[i].model[0] != '\0' && strcmp(s_devices[i].model, friendly_name) == 0)) {
             return &s_devices[i];
         }
     }
     return NULL;
 }
 
-static void registry_store(uint16_t short_addr, uint8_t ep)
+static void registry_store(uint16_t short_addr, uint8_t ep, const char *manufacturer, const char *model)
 {
     char friendly_name[24];
+    char alias_name[80];
+    char manufacturer_name[32];
+    char model_name[32];
     size_t i;
 
     snprintf(friendly_name, sizeof(friendly_name), "trv_%04hx", short_addr);
+    sanitize_name_component(manufacturer, manufacturer_name, sizeof(manufacturer_name));
+    sanitize_name_component(model, model_name, sizeof(model_name));
+    if (manufacturer_name[0] != '\0' && model_name[0] != '\0') {
+        snprintf(alias_name, sizeof(alias_name), "%s_%s_%04hx", manufacturer_name, model_name, short_addr);
+    } else if (model_name[0] != '\0') {
+        snprintf(alias_name, sizeof(alias_name), "%s_%04hx", model_name, short_addr);
+    } else if (manufacturer_name[0] != '\0') {
+        snprintf(alias_name, sizeof(alias_name), "%s_%04hx", manufacturer_name, short_addr);
+    } else {
+        alias_name[0] = '\0';
+    }
+
     for (i = 0; i < sizeof(s_devices) / sizeof(s_devices[0]); i++) {
         if (s_devices[i].in_use && s_devices[i].short_addr == short_addr && s_devices[i].ep == ep) {
             snprintf(s_devices[i].friendly_name, sizeof(s_devices[i].friendly_name), "%s", friendly_name);
+            if (alias_name[0] != '\0') {
+                snprintf(s_devices[i].alias_name, sizeof(s_devices[i].alias_name), "%s", alias_name);
+            }
+            if (manufacturer_name[0] != '\0') {
+                snprintf(s_devices[i].manufacturer, sizeof(s_devices[i].manufacturer), "%s", manufacturer_name);
+            }
+            if (model_name[0] != '\0') {
+                snprintf(s_devices[i].model, sizeof(s_devices[i].model), "%s", model_name);
+            }
             return;
         }
     }
@@ -115,6 +150,15 @@ static void registry_store(uint16_t short_addr, uint8_t ep)
             s_devices[i].short_addr = short_addr;
             s_devices[i].ep = ep;
             snprintf(s_devices[i].friendly_name, sizeof(s_devices[i].friendly_name), "%s", friendly_name);
+            if (alias_name[0] != '\0') {
+                snprintf(s_devices[i].alias_name, sizeof(s_devices[i].alias_name), "%s", alias_name);
+            }
+            if (manufacturer_name[0] != '\0') {
+                snprintf(s_devices[i].manufacturer, sizeof(s_devices[i].manufacturer), "%s", manufacturer_name);
+            }
+            if (model_name[0] != '\0') {
+                snprintf(s_devices[i].model, sizeof(s_devices[i].model), "%s", model_name);
+            }
             return;
         }
     }
@@ -170,21 +214,31 @@ static void send_test_result(const char *friendly_name, const char *status, cons
 static void publish_trv_field(uint16_t short_addr, uint8_t src_ep, const char *field, double value, const char *state)
 {
     char friendly_name[24];
+    char display_name[80];
     char ieee_text[32];
     ezb_extaddr_t extaddr = {0};
+    coord_device_t *device;
 
     snprintf(friendly_name, sizeof(friendly_name), "trv_%04hx", short_addr);
+    display_name[0] = '\0';
+    device = registry_lookup(friendly_name);
+    if (device != NULL && device->alias_name[0] != '\0') {
+        snprintf(display_name, sizeof(display_name), "%s", device->alias_name);
+    } else {
+        snprintf(display_name, sizeof(display_name), "%s", friendly_name);
+    }
     if (ezb_address_extended_by_short(short_addr, &extaddr) == EZB_ERR_NONE) {
         snprintf(ieee_text, sizeof(ieee_text), "0x%016llx", extaddr.u64);
     } else {
         snprintf(ieee_text, sizeof(ieee_text), "0x%04hx", short_addr);
     }
 
-    registry_store(short_addr, src_ep);
+    registry_store(short_addr, src_ep, NULL, NULL);
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "type", "trv_telemetry");
     cJSON_AddStringToObject(root, "friendly_name", friendly_name);
+    cJSON_AddStringToObject(root, "display_name", display_name);
     cJSON_AddStringToObject(root, "ieee", ieee_text);
     cJSON_AddNumberToObject(root, "source_ep", src_ep);
     cJSON_AddNumberToObject(root, "timestamp", (double)(esp_timer_get_time() / 1000000));
@@ -198,6 +252,21 @@ static void publish_trv_field(uint16_t short_addr, uint8_t src_ep, const char *f
     } else if (strcmp(field, "battery") == 0) {
         cJSON_AddNumberToObject(root, field, value);
         cJSON_AddNumberToObject(root, "battery", value);
+    } else if (strcmp(field, "battery_voltage") == 0) {
+        cJSON_AddNumberToObject(root, field, value);
+        cJSON_AddNumberToObject(root, "battery_voltage", value);
+    } else if (strcmp(field, "humidity") == 0) {
+        cJSON_AddNumberToObject(root, field, value);
+        cJSON_AddNumberToObject(root, "humidity", value);
+    } else if (strcmp(field, "pi_heating_demand") == 0) {
+        cJSON_AddNumberToObject(root, field, value);
+        cJSON_AddNumberToObject(root, "pi_heating_demand", value);
+    } else if (strcmp(field, "unoccupied_heating_setpoint") == 0) {
+        cJSON_AddNumberToObject(root, field, value);
+        cJSON_AddNumberToObject(root, "unoccupied_heating_setpoint", value);
+    } else if (strcmp(field, "system_mode") == 0 && state != NULL) {
+        cJSON_AddNumberToObject(root, "system_mode_raw", value);
+        cJSON_AddStringToObject(root, "system_mode", state);
     } else if (strcmp(field, "running_state") == 0 && state != NULL) {
         cJSON_AddNumberToObject(root, "running_state_raw", value);
         cJSON_AddStringToObject(root, "running_state", state);
@@ -212,11 +281,26 @@ static void publish_trv_field(uint16_t short_addr, uint8_t src_ep, const char *f
 static void publish_discovery_event(uint16_t short_addr, uint8_t src_ep, const char *manufacturer, const char *model)
 {
     char friendly_name[24];
+    char display_name[80];
+    char manufacturer_name[32];
+    char model_name[32];
     snprintf(friendly_name, sizeof(friendly_name), "trv_%04hx", short_addr);
+    sanitize_name_component(manufacturer, manufacturer_name, sizeof(manufacturer_name));
+    sanitize_name_component(model, model_name, sizeof(model_name));
+    if (manufacturer_name[0] != '\0' && model_name[0] != '\0') {
+        snprintf(display_name, sizeof(display_name), "%s_%s_%04hx", manufacturer_name, model_name, short_addr);
+    } else if (model_name[0] != '\0') {
+        snprintf(display_name, sizeof(display_name), "%s_%04hx", model_name, short_addr);
+    } else if (manufacturer_name[0] != '\0') {
+        snprintf(display_name, sizeof(display_name), "%s_%04hx", manufacturer_name, short_addr);
+    } else {
+        snprintf(display_name, sizeof(display_name), "%s", friendly_name);
+    }
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "type", "zigbee_event");
     cJSON_AddStringToObject(root, "friendly_name", friendly_name);
+    cJSON_AddStringToObject(root, "display_name", display_name);
     cJSON_AddStringToObject(root, "event", "device_discovered");
     cJSON_AddNumberToObject(root, "short_addr", short_addr);
     cJSON_AddNumberToObject(root, "source_ep", src_ep);
@@ -229,7 +313,7 @@ static void publish_discovery_event(uint16_t short_addr, uint8_t src_ep, const c
     cJSON_AddNumberToObject(root, "timestamp", (double)(esp_timer_get_time() / 1000000));
     uart_send_json(root);
     cJSON_Delete(root);
-    registry_store(short_addr, src_ep);
+    registry_store(short_addr, src_ep, manufacturer, model);
 }
 
 static void heartbeat_task(void *arg)
@@ -300,8 +384,20 @@ static void handle_set_command(const cJSON *json)
                     mode = 0x00;
                 } else if (strcmp(system_mode->valuestring, "auto") == 0) {
                     mode = 0x01;
+                } else if (strcmp(system_mode->valuestring, "cool") == 0) {
+                    mode = 0x03;
                 } else if (strcmp(system_mode->valuestring, "heat") == 0) {
                     mode = 0x04;
+                } else if (strcmp(system_mode->valuestring, "emergency_heating") == 0) {
+                    mode = 0x05;
+                } else if (strcmp(system_mode->valuestring, "precooling") == 0) {
+                    mode = 0x06;
+                } else if (strcmp(system_mode->valuestring, "fan_only") == 0) {
+                    mode = 0x07;
+                } else if (strcmp(system_mode->valuestring, "dry") == 0) {
+                    mode = 0x08;
+                } else if (strcmp(system_mode->valuestring, "sleep") == 0) {
+                    mode = 0x09;
                 } else {
                     ESP_LOGW(TAG, "Unsupported system_mode %s", system_mode->valuestring);
                     mode = 0xFF;
@@ -534,6 +630,18 @@ static ezb_err_t write_thermostat_preset(uint16_t short_addr, uint8_t ep, const 
     } else if (strcmp(preset, "auto") == 0 || strcmp(preset, "schedule") == 0 || strcmp(preset, "comfort") == 0 ||
                strcmp(preset, "boost") == 0 || strcmp(preset, "heat") == 0) {
         mode = 0x04;
+    } else if (strcmp(preset, "cool") == 0) {
+        mode = 0x03;
+    } else if (strcmp(preset, "sleep") == 0) {
+        mode = 0x09;
+    } else if (strcmp(preset, "fan_only") == 0) {
+        mode = 0x07;
+    } else if (strcmp(preset, "dry") == 0) {
+        mode = 0x08;
+    } else if (strcmp(preset, "emergency_heating") == 0) {
+        mode = 0x05;
+    } else if (strcmp(preset, "precooling") == 0) {
+        mode = 0x06;
     } else {
         return EZB_ERR_FAIL;
     }
@@ -779,9 +887,24 @@ static void zcl_core_cmd_report_attr_handler(ezb_zcl_cmd_report_attr_message_t *
                 publish_trv_field(short_addr, src_ep, "local_temperature", (*(int16_t *)var->attr_value) / 100.0, NULL);
             } else if (var->attr_id == 0x0012) {
                 publish_trv_field(short_addr, src_ep, "occupied_heating_setpoint", (*(int16_t *)var->attr_value) / 100.0, NULL);
+            } else if (var->attr_id == 0x0014) {
+                publish_trv_field(short_addr, src_ep, "unoccupied_heating_setpoint", (*(int16_t *)var->attr_value) / 100.0, NULL);
+            } else if (var->attr_id == 0x001C) {
+                uint8_t mode = *(uint8_t *)var->attr_value;
+                publish_trv_field(short_addr, src_ep, "system_mode", (double)mode, thermostat_system_mode_name(mode));
             } else if (var->attr_id == 0x0029) {
                 uint8_t state = *(uint8_t *)var->attr_value;
                 publish_trv_field(short_addr, src_ep, "running_state", (double)state, state ? "heat" : "idle");
+            } else if (var->attr_id == 0x0008) {
+                publish_trv_field(short_addr, src_ep, "pi_heating_demand", (*(uint8_t *)var->attr_value), NULL);
+            }
+            var = var->next;
+        }
+        break;
+    case EZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT:
+        while (var) {
+            if (var->attr_id == 0x0000) {
+                publish_trv_field(short_addr, src_ep, "humidity", (*(uint16_t *)var->attr_value) / 100.0, NULL);
             }
             var = var->next;
         }
@@ -790,6 +913,8 @@ static void zcl_core_cmd_report_attr_handler(ezb_zcl_cmd_report_attr_message_t *
         while (var) {
             if (var->attr_id == 0x0021) {
                 publish_trv_field(short_addr, src_ep, "battery", (*(uint8_t *)var->attr_value) / 2.0, NULL);
+            } else if (var->attr_id == 0x0001) {
+                publish_trv_field(short_addr, src_ep, "battery_voltage", (*(uint8_t *)var->attr_value) / 10.0, NULL);
             }
             var = var->next;
         }
@@ -962,4 +1087,69 @@ void app_main(void)
     xTaskCreate(command_task, "command_task", 4096, NULL, 5, NULL);
     xTaskCreate(heartbeat_task, "heartbeat_task", 2048, NULL, 4, NULL);
     publish_mode_status();
+}
+static void sanitize_name_component(const char *src, char *dst, size_t dst_size)
+{
+    size_t i;
+    size_t out = 0;
+    bool prev_underscore = false;
+
+    if (dst_size == 0) {
+        return;
+    }
+
+    dst[0] = '\0';
+    if (src == NULL) {
+        return;
+    }
+
+    for (i = 0; src[i] != '\0' && out + 1 < dst_size; i++) {
+        char ch = src[i];
+        if ((ch >= 'A' && ch <= 'Z')) {
+            ch = (char)(ch - 'A' + 'a');
+        }
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'))) {
+            ch = '_';
+        }
+        if (ch == '_') {
+            if (prev_underscore || out == 0) {
+                continue;
+            }
+            prev_underscore = true;
+        } else {
+            prev_underscore = false;
+        }
+        dst[out++] = ch;
+    }
+
+    while (out > 0 && dst[out - 1] == '_') {
+        out--;
+    }
+    dst[out] = '\0';
+}
+
+static const char *thermostat_system_mode_name(uint8_t mode)
+{
+    switch (mode) {
+    case EZB_ZCL_THERMOSTAT_SYSTEM_MODE_OFF:
+        return "off";
+    case EZB_ZCL_THERMOSTAT_SYSTEM_MODE_AUTO:
+        return "auto";
+    case EZB_ZCL_THERMOSTAT_SYSTEM_MODE_COOL:
+        return "cool";
+    case EZB_ZCL_THERMOSTAT_SYSTEM_MODE_HEAT:
+        return "heat";
+    case EZB_ZCL_THERMOSTAT_SYSTEM_MODE_EMERGENCY_HEATING:
+        return "emergency_heating";
+    case EZB_ZCL_THERMOSTAT_SYSTEM_MODE_PRECOOLING:
+        return "precooling";
+    case EZB_ZCL_THERMOSTAT_SYSTEM_MODE_FAN_ONLY:
+        return "fan_only";
+    case EZB_ZCL_THERMOSTAT_SYSTEM_MODE_DRY:
+        return "dry";
+    case EZB_ZCL_THERMOSTAT_SYSTEM_MODE_SLEEP:
+        return "sleep";
+    default:
+        return "unknown";
+    }
 }
