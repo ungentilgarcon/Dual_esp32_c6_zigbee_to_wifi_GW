@@ -64,12 +64,28 @@ Fields:
 
 If the JSON still contains placeholders on boot, the bridge starts a provisioning AP.
 
-Provisioning AP:
+### Provisioning AP (fallback)
 
-- SSID: `GW-SETUP-XXXXXX`
-- password: `configure123`
+Whenever the bridge cannot load valid Wi-Fi/MQTT settings — either because `bridge_config.json`
+still has placeholder values or is missing entirely — it automatically starts a setup access point
+instead of trying to connect to Wi-Fi.
 
-Open `http://192.168.4.1/` and save the values.
+| Item | Value |
+|------|-------|
+| SSID | `GW-SETUP-XXXXXX` (last 6 hex digits of the board MAC) |
+| Password | `configure123` |
+| Gateway IP | `192.168.4.1` |
+| Config page | `http://192.168.4.1/` |
+| Sensor status | `http://192.168.4.1/status` |
+
+Steps:
+1. Connect your phone or laptop to the `GW-SETUP-XXXXXX` network with password `configure123`.
+2. Open `http://192.168.4.1/` in a browser.
+3. Fill in Wi-Fi SSID, Wi-Fi password, MQTT broker URI (e.g. `mqtt://192.168.1.10:1883`) and MQTT topic base (default `zigbee2mqtt`).
+4. Click **Save & reboot**. The bridge saves the config to SPIFFS and reboots automatically.
+
+> The AP is only active when the config is invalid.  Once valid credentials are saved, normal
+> STA+MQTT operation starts on the next boot.
 
 ## 7. MQTT topic model
 
@@ -110,19 +126,103 @@ Command example:
 - **normal**: real Zigbee operations
 - **test**: test heartbeats plus normal Zigbee stack activity
 
-Switch mode with:
+The mode switch is initiated from the **Wi-Fi bridge**. It receives the command (via MQTT or the
+provisioning/status web page) and forwards it to the Zigbee coordinator over UART.
 
-```json
-{"mode":"test"}
+### Option A — Web page (no MQTT required)
+
+- **In AP mode** (`http://192.168.4.1/`): use the **Mode switch** buttons at the bottom of the setup page, or visit `http://192.168.4.1/status`.
+- **In normal STA mode**: visit `http://<device-ip>/` — the status page always includes mode switch buttons.
+
+### Option B — MQTT publish
+
+During normal operation, publish to:
+
+```
+topic:   zigbee2mqtt/gateway_control/set
+payload: {"mode":"test"}
 ```
 
-or:
+Switch back with:
 
-```json
-{"mode":"normal"}
+```
+payload: {"mode":"normal"}
 ```
 
-## 10. TRV naming and registry
+#### Via Home Assistant (Developer Tools)
+
+1. Open **Developer Tools → Actions**.
+2. Search for `mqtt.publish`.
+3. Set:
+   - **Topic**: `zigbee2mqtt/gateway_control/set`
+   - **Payload**: `{"mode":"test"}`
+4. Click **Perform action**.
+
+#### Via MQTT Explorer (desktop GUI, easiest)
+
+1. Download [MQTT Explorer](http://mqtt-explorer.com/) and connect to your broker.
+2. In the **Publish** panel set:
+   - **Topic**: `zigbee2mqtt/gateway_control/set`
+   - **Payload**: `{"mode":"test"}`
+3. Click **Publish**.
+
+#### Via command line (mosquitto_pub)
+
+```bash
+# Enable test mode
+mosquitto_pub -h <broker_ip> -t zigbee2mqtt/gateway_control/set -m '{"mode":"test"}'
+
+# Return to normal mode
+mosquitto_pub -h <broker_ip> -t zigbee2mqtt/gateway_control/set -m '{"mode":"normal"}'
+```
+
+On Windows (Command Prompt), escape the inner quotes:
+
+```cmd
+mosquitto_pub -h <broker_ip> -t zigbee2mqtt/gateway_control/set -m "{\"mode\":\"test\"}"
+mosquitto_pub -h <broker_ip> -t zigbee2mqtt/gateway_control/set -m "{\"mode\":\"normal\"}"
+```
+
+## 10. Live sensor status web page
+
+The bridge always runs an HTTP server on port 80 showing a table of the latest telemetry
+received from all Zigbee devices. The page **auto-refreshes every 10 seconds**.
+
+| Mode | URL |
+|------|-----|
+| AP provisioning mode | `http://192.168.4.1/status` |
+| Normal STA mode | `http://<device-ip>/` (logged to serial on first DHCP lease) |
+
+The table shows one row per device with all reported fields (temperature, battery, setpoint, etc.)
+and a "last seen N s ago" column. The page also has **Mode switch** and **Factory reset** buttons.
+
+> **Finding the device IP in STA mode:** watch the serial log at boot; the line
+> `Wi-Fi connected — status page: http://x.x.x.x/` is printed once the IP is obtained.
+> Alternatively, check your router's DHCP client list.
+
+## 11. Factory reset
+
+If the gateway is misconfigured (wrong Wi-Fi password, bad MQTT URI, etc.) and you can no longer
+reach it over the network, you can reset it to factory defaults in two ways:
+
+### Method 1 — 5 rapid reboots
+
+Power-cycle (or hard-reset) the board **5 times in a row**, with each reboot happening within
+**15 seconds** of the previous one.
+
+What happens internally:
+1. NVS stores a rapid-reboot counter that increments on every boot.
+2. After 15 seconds of stable operation the counter is cleared to 0.
+3. When the counter reaches 5, the firmware deletes `bridge_config.json` and reboots into
+   provisioning AP mode on the next start.
+
+### Method 2 — Factory reset button in the web UI
+
+Both the setup page (`http://192.168.4.1/`) and the status page (`http://<device-ip>/`) have a
+red **Factory reset** button. Clicking it and confirming the dialog deletes `bridge_config.json`
+and reboots into provisioning AP mode immediately.
+
+## 12. TRV naming and registry
 
 Default names are based on short address:
 
@@ -130,7 +230,7 @@ Default names are based on short address:
 
 The coordinator also records manufacturer/model aliases when it can read them, so you can address devices with richer names.
 
-## 11. TRV701Z preset mapping
+## 13. TRV701Z preset mapping
 
 The coordinator includes a TRV701Z-specific preset profile.
 
@@ -142,20 +242,23 @@ Current mapping:
 - `sleep` -> sleep
 - `cool`, `fan_only`, `dry` and other supported values are mapped where applicable
 
-## 12. UART protocol summary
+## 14. UART protocol summary
 
 See:
 
 - [uart_frames.md](C:/Users/GBAH/Documents/Dual_esp32_c6_zigbee_to_wifi_GW/protocol/uart_frames.md)
 
-## 13. Troubleshooting
+## 15. Troubleshooting
 
 - If Wi-Fi does not connect, check `bridge_config.json`.
-- If provisioning AP never appears, verify the JSON file still contains placeholders.
+- If provisioning AP never appears, verify the JSON file still contains placeholders (fields starting with `YOUR_`).
 - If MQTT is silent, confirm the broker URI and topic base.
 - If Zigbee commands do not land, check UART wiring and endpoint discovery.
+- If the status page is blank ("No sensor data received yet"), the Zigbee coordinator has not yet
+  sent any telemetry; check UART wiring and that the coordinator is running.
+- To recover from a bad configuration, use one of the factory reset methods described in section 11.
 
-## 14. Recommended next improvements
+## 16. Recommended next improvements
 
 - captive portal with nicer form
 - provisioning reset command/button

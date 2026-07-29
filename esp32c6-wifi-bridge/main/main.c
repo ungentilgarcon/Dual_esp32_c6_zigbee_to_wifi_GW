@@ -18,6 +18,9 @@
 #include "nvs_flash.h"
 #include "cJSON.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
+#include "esp_timer.h"
+#include "nvs.h"
 
 #include "bridge_config.h"
 
@@ -25,6 +28,29 @@ static const char *TAG = "WIFI_BRIDGE";
 static esp_mqtt_client_handle_t s_mqtt = NULL;
 static httpd_handle_t s_http = NULL;
 static EventGroupHandle_t s_provision_event_group = NULL;
+
+/* forward declarations */
+static esp_err_t provision_mode_post_handler(httpd_req_t *req);
+static esp_err_t status_page_get_handler(httpd_req_t *req);
+static esp_err_t provision_reset_post_handler(httpd_req_t *req);
+
+static httpd_handle_t s_status_http = NULL;
+
+/* ---- sensor status store ---- */
+#define STATUS_MAX_DEVICES  16
+#define STATUS_PAYLOAD_LEN  480
+#define FACTORY_RESET_COUNT 5
+#define FACTORY_RESET_MS    15000
+
+typedef struct {
+    char     friendly_name[64];
+    char     payload_json[STATUS_PAYLOAD_LEN];
+    int64_t  last_seen_us;
+} device_status_t;
+
+static device_status_t   s_device_status[STATUS_MAX_DEVICES];
+static int               s_device_status_count = 0;
+static SemaphoreHandle_t s_status_mutex        = NULL;
 
 #define PROVISION_DONE_BIT BIT0
 #define BRIDGE_PROVISION_AP_PASS "configure123"
@@ -78,6 +104,73 @@ static bool bridge_config_is_valid(void)
            !is_placeholder_string(s_cfg.wifi_pass) &&
            !is_placeholder_string(s_cfg.mqtt_uri) &&
            !is_placeholder_string(s_cfg.mqtt_base_topic);
+}
+
+/* ---- sensor status update ---- */
+static void update_device_status(const char *friendly_name, const char *payload_json)
+{
+    int i;
+    if (s_status_mutex == NULL) return;
+    xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    for (i = 0; i < s_device_status_count; i++) {
+        if (strcmp(s_device_status[i].friendly_name, friendly_name) == 0) {
+            snprintf(s_device_status[i].payload_json, STATUS_PAYLOAD_LEN, "%s", payload_json);
+            s_device_status[i].last_seen_us = esp_timer_get_time();
+            xSemaphoreGive(s_status_mutex);
+            return;
+        }
+    }
+    if (s_device_status_count < STATUS_MAX_DEVICES) {
+        snprintf(s_device_status[s_device_status_count].friendly_name,
+                 sizeof(s_device_status[0].friendly_name), "%s", friendly_name);
+        snprintf(s_device_status[s_device_status_count].payload_json,
+                 STATUS_PAYLOAD_LEN, "%s", payload_json);
+        s_device_status[s_device_status_count].last_seen_us = esp_timer_get_time();
+        s_device_status_count++;
+    }
+    xSemaphoreGive(s_status_mutex);
+}
+
+/* ---- factory reset via rapid reboots ---- */
+static void factory_reset_clear_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(FACTORY_RESET_MS));
+    nvs_handle_t h;
+    if (nvs_open("bridge", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "rst_count", 0);
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "Rapid-reboot counter cleared after %d ms stable", FACTORY_RESET_MS);
+    }
+    vTaskDelete(NULL);
+}
+
+/* Returns true when the counter reached FACTORY_RESET_COUNT rapid reboots. */
+static bool check_reboot_counter(void)
+{
+    nvs_handle_t h;
+    uint8_t count = 0;
+
+    if (nvs_open("bridge", NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGW(TAG, "NVS open failed; skipping reboot counter");
+        return false;
+    }
+    nvs_get_u8(h, "rst_count", &count); /* key-not-found leaves count at 0 */
+    count++;
+    ESP_LOGI(TAG, "Rapid-reboot count: %u / %u", (unsigned)count, (unsigned)FACTORY_RESET_COUNT);
+    if (count >= FACTORY_RESET_COUNT) {
+        ESP_LOGW(TAG, "Factory reset triggered after %u rapid reboots", (unsigned)count);
+        count = 0;
+        nvs_set_u8(h, "rst_count", count);
+        nvs_commit(h);
+        nvs_close(h);
+        return true;
+    }
+    nvs_set_u8(h, "rst_count", count);
+    nvs_commit(h);
+    nvs_close(h);
+    return false;
 }
 
 static void mount_spiffs(void) {
@@ -251,14 +344,35 @@ static void wifi_provisioning_start_ap(void)
 static esp_err_t provision_root_get_handler(httpd_req_t *req)
 {
     const char html[] =
-        "<!doctype html><html><body>"
-        "<h1>Gateway setup</h1>"
+        "<!doctype html><html><head>"
+        "<meta charset='utf-8'><title>Gateway Setup</title>"
+        "<style>body{font-family:sans-serif;padding:16px;max-width:520px}"
+        "h2{color:#333}.btn{padding:8px 16px;margin:4px;cursor:pointer;"
+        "border:1px solid #888;border-radius:4px;background:#e8e8e8}"
+        ".btn:hover{background:#d0d0d0}"
+        "input{width:100%;margin:2px 0 10px;padding:4px;box-sizing:border-box}"
+        "</style></head><body>"
+        "<h1>&#x2699; Gateway Setup</h1>"
+        "<p><a href='/status'>&#x1F4CA; Live sensor status &rarr;</a></p>"
         "<form id='cfg'>"
         "Wi-Fi SSID:<br><input name='wifi_ssid'><br>"
         "Wi-Fi password:<br><input name='wifi_password' type='password'><br>"
         "MQTT URI:<br><input name='mqtt_uri' value='mqtt://192.168.1.10:1883'><br>"
         "MQTT topic base:<br><input name='mqtt_base_topic' value='zigbee2mqtt'><br>"
-        "<button type='button' onclick=\"fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({wifi_ssid:document.querySelector('[name=wifi_ssid]').value,wifi_password:document.querySelector('[name=wifi_password]').value,mqtt_uri:document.querySelector('[name=mqtt_uri]').value,mqtt_base_topic:document.querySelector('[name=mqtt_base_topic]').value})}).then(r=>r.text()).then(t=>document.body.innerHTML='<pre>'+t+'</pre>')\">Save</button></form>"
+        "<button class='btn' type='button' onclick=\"fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({wifi_ssid:document.querySelector('[name=wifi_ssid]').value,wifi_password:document.querySelector('[name=wifi_password]').value,mqtt_uri:document.querySelector('[name=mqtt_uri]').value,mqtt_base_topic:document.querySelector('[name=mqtt_base_topic]').value})}).then(r=>r.text()).then(t=>document.body.innerHTML='<pre>'+t+'</pre>')\">Save &amp; reboot</button>"
+        "</form>"
+        "<hr><h2>Mode switch</h2>"
+        "<p>Forwards a command directly to the Zigbee coordinator over UART.</p>"
+        "<button class='btn' type='button' onclick=\"fetch('/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'test'})}).then(r=>r.text()).then(t=>alert(t))\">&#x1F9EA; Test mode</button> "
+        "<button class='btn' type='button' onclick=\"fetch('/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'normal'})}).then(r=>r.text()).then(t=>alert(t))\">&#x2705; Normal mode</button>"
+        "<hr><h2>Factory reset</h2>"
+        "<p>Deletes the saved configuration and reboots into setup AP mode.</p>"
+        "<p><small>You can also trigger this by rebooting the device "
+        "5&nbsp;times in a row, each within 15&nbsp;s of the previous reboot.</small></p>"
+        "<button class='btn' style='background:#f88;border-color:#c44' type='button' "
+        "onclick=\"if(confirm('Delete config and reboot into setup AP?'))"
+        "fetch('/reset',{method:'POST'}).then(r=>r.text()).then(t=>alert(t))\">"
+        "&#x26A0; Factory reset</button>"
         "</body></html>";
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
@@ -348,6 +462,140 @@ static esp_err_t provision_save_post_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "saved; rebooting");
 }
 
+/* ---- /reset: delete config + reboot ---- */
+static esp_err_t provision_reset_post_handler(httpd_req_t *req)
+{
+    remove(BRIDGE_CONFIG_PATH);
+    ESP_LOGW(TAG, "Factory reset via HTTP: config deleted, rebooting");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "Config deleted. Rebooting into setup AP...");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;
+}
+
+/* ---- /status: live sensor table, always-on ---- */
+static esp_err_t status_page_get_handler(httpd_req_t *req)
+{
+    char chunk[512];
+    int  i;
+    int64_t uptime_s = esp_timer_get_time() / 1000000LL;
+
+    httpd_resp_set_type(req, "text/html");
+
+    /* head + CSS */
+    httpd_resp_sendstr_chunk(req,
+        "<!doctype html><html><head>"
+        "<meta charset='utf-8'>"
+        "<meta http-equiv='refresh' content='10'>"
+        "<title>Gateway Status</title>"
+        "<style>"
+        "body{font-family:sans-serif;padding:16px;max-width:960px}"
+        "h1,h2{color:#333}"
+        "table{border-collapse:collapse;width:100%;margin:12px 0}"
+        "th,td{border:1px solid #ccc;padding:6px 10px;text-align:left;vertical-align:top}"
+        "th{background:#f4f4f4}tr:nth-child(even){background:#fafafa}"
+        ".btn{padding:8px 18px;margin:4px;cursor:pointer;border:1px solid #888;"
+        "border-radius:4px;background:#e8e8e8}.btn:hover{background:#d0d0d0}"
+        ".info{color:#777;font-size:.9em}"
+        "</style></head><body>");
+
+    /* heading + uptime */
+    snprintf(chunk, sizeof(chunk),
+             "<h1>&#x1F4E1; Gateway Sensor Status</h1>"
+             "<p class='info'>Auto-refreshes every 10&nbsp;s &middot; "
+             "Device uptime: %lld&nbsp;s</p>",
+             uptime_s);
+    httpd_resp_sendstr_chunk(req, chunk);
+
+    /* sensor table */
+    if (s_status_mutex != NULL) {
+        xSemaphoreTake(s_status_mutex, portMAX_DELAY);
+    }
+
+    if (s_device_status_count == 0) {
+        httpd_resp_sendstr_chunk(req, "<p>No sensor data received yet.</p>");
+    } else {
+        int64_t now_us = esp_timer_get_time();
+        httpd_resp_sendstr_chunk(req,
+            "<table><tr>"
+            "<th>Device</th><th>Telemetry</th><th>Last&nbsp;seen</th>"
+            "</tr>");
+
+        for (i = 0; i < s_device_status_count; i++) {
+            snprintf(chunk, sizeof(chunk),
+                     "<tr><td><strong>%s</strong></td><td>",
+                     s_device_status[i].friendly_name);
+            httpd_resp_sendstr_chunk(req, chunk);
+
+            cJSON *payload = cJSON_Parse(s_device_status[i].payload_json);
+            if (payload != NULL) {
+                cJSON *field = payload->child;
+                while (field != NULL) {
+                    if (cJSON_IsNumber(field)) {
+                        snprintf(chunk, sizeof(chunk),
+                                 "<b>%s</b>:&nbsp;%.2f<br>",
+                                 field->string, field->valuedouble);
+                        httpd_resp_sendstr_chunk(req, chunk);
+                    } else if (cJSON_IsString(field)) {
+                        snprintf(chunk, sizeof(chunk),
+                                 "<b>%s</b>:&nbsp;%s<br>",
+                                 field->string, field->valuestring);
+                        httpd_resp_sendstr_chunk(req, chunk);
+                    } else if (cJSON_IsBool(field)) {
+                        snprintf(chunk, sizeof(chunk),
+                                 "<b>%s</b>:&nbsp;%s<br>",
+                                 field->string,
+                                 cJSON_IsTrue(field) ? "true" : "false");
+                        httpd_resp_sendstr_chunk(req, chunk);
+                    }
+                    field = field->next;
+                }
+                cJSON_Delete(payload);
+            }
+
+            int64_t age_s =
+                (now_us - s_device_status[i].last_seen_us) / 1000000LL;
+            snprintf(chunk, sizeof(chunk),
+                     "</td><td>%lld&nbsp;s ago</td></tr>", age_s);
+            httpd_resp_sendstr_chunk(req, chunk);
+        }
+        httpd_resp_sendstr_chunk(req, "</table>");
+    }
+
+    if (s_status_mutex != NULL) {
+        xSemaphoreGive(s_status_mutex);
+    }
+
+    /* mode switch */
+    httpd_resp_sendstr_chunk(req,
+        "<hr><h2>Mode switch</h2>"
+        "<p>Commands are forwarded to the Zigbee coordinator over UART.</p>"
+        "<button class='btn' onclick=\"fetch('/mode',{method:'POST',"
+        "headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify({mode:'test'})}).then(r=>r.text()).then(t=>alert(t))\">"
+        "&#x1F9EA; Enable test mode</button> "
+        "<button class='btn' onclick=\"fetch('/mode',{method:'POST',"
+        "headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify({mode:'normal'})}).then(r=>r.text()).then(t=>alert(t))\">"
+        "&#x2705; Normal mode</button>");
+
+    /* factory reset */
+    httpd_resp_sendstr_chunk(req,
+        "<hr><h2>Factory reset</h2>"
+        "<p>Deletes <code>bridge_config.json</code> and reboots into provisioning AP mode.</p>"
+        "<p><small>You can also trigger this by rebooting 5 times rapidly "
+        "(within 15&nbsp;s each time).</small></p>"
+        "<button class='btn' style='background:#f88;border-color:#c44' "
+        "onclick=\"if(confirm('Delete config and reboot into setup AP?'))"
+        "fetch('/reset',{method:'POST'}).then(r=>r.text()).then(t=>alert(t))\">"
+        "&#x26A0; Factory reset</button>"
+        "</body></html>");
+
+    httpd_resp_sendstr_chunk(req, NULL);
+    return ESP_OK;
+}
+
 static httpd_handle_t start_provisioning_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -370,6 +618,24 @@ static httpd_handle_t start_provisioning_server(void)
         .handler = provision_save_post_handler,
         .user_ctx = NULL,
     };
+    httpd_uri_t mode_uri = {
+        .uri = "/mode",
+        .method = HTTP_POST,
+        .handler = provision_mode_post_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t status_uri = {
+        .uri = "/status",
+        .method = HTTP_GET,
+        .handler = status_page_get_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t reset_uri = {
+        .uri = "/reset",
+        .method = HTTP_POST,
+        .handler = provision_reset_post_handler,
+        .user_ctx = NULL,
+    };
 
     if (httpd_start(&server, &config) != ESP_OK) {
         return NULL;
@@ -378,6 +644,9 @@ static httpd_handle_t start_provisioning_server(void)
     httpd_register_uri_handler(server, &root_uri);
     httpd_register_uri_handler(server, &config_uri);
     httpd_register_uri_handler(server, &save_uri);
+    httpd_register_uri_handler(server, &mode_uri);
+    httpd_register_uri_handler(server, &status_uri);
+    httpd_register_uri_handler(server, &reset_uri);
     return server;
 }
 
@@ -402,6 +671,41 @@ static void provisioning_mode(void)
     esp_restart();
 }
 
+/* ---- status HTTP server (always-on, port 80, STA mode) ---- */
+static httpd_handle_t start_status_server(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_handle_t server = NULL;
+    httpd_uri_t root_uri = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = status_page_get_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t mode_uri = {
+        .uri = "/mode",
+        .method = HTTP_POST,
+        .handler = provision_mode_post_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t reset_uri = {
+        .uri = "/reset",
+        .method = HTTP_POST,
+        .handler = provision_reset_post_handler,
+        .user_ctx = NULL,
+    };
+
+    if (httpd_start(&server, &config) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start status HTTP server");
+        return NULL;
+    }
+    httpd_register_uri_handler(server, &root_uri);
+    httpd_register_uri_handler(server, &mode_uri);
+    httpd_register_uri_handler(server, &reset_uri);
+    ESP_LOGI(TAG, "Status HTTP server started on port 80");
+    return server;
+}
+
 static void uart_init(void) {
     const uart_config_t cfg = {
         .baud_rate = BRIDGE_UART_BAUDRATE,
@@ -418,7 +722,6 @@ static void uart_init(void) {
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     (void)arg;
-    (void)event_data;
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
         return;
@@ -431,7 +734,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     }
 
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ESP_LOGI(TAG, "Wi-Fi connected");
+        ip_event_got_ip_t *ev = (ip_event_got_ip_t *)event_data;
+        uint8_t *ip = (uint8_t *)&ev->ip_info.ip.addr;
+        ESP_LOGI(TAG, "Wi-Fi connected — status page: http://%d.%d.%d.%d/",
+                 ip[0], ip[1], ip[2], ip[3]);
     }
 }
 
@@ -612,6 +918,31 @@ static void forward_mode_command_to_uart(const char *payload, int payload_len) {
     cJSON_Delete(payload_json);
 }
 
+static esp_err_t provision_mode_post_handler(httpd_req_t *req)
+{
+    char buf[64];
+    int remaining = req->content_len;
+    int received = 0;
+
+    if (remaining <= 0 || remaining >= (int)sizeof(buf)) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body size");
+    }
+    while (remaining > 0) {
+        int chunk = httpd_req_recv(req, buf + received, remaining);
+        if (chunk <= 0) {
+            return ESP_FAIL;
+        }
+        received += chunk;
+        remaining -= chunk;
+    }
+    buf[received] = '\0';
+
+    forward_mode_command_to_uart(buf, received);
+
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, "ok");
+}
+
 static int topic_is_gateway_control_set(const char *topic) {
     char expected[128];
     snprintf(expected, sizeof(expected), "%s/gateway_control/set", s_cfg.mqtt_base_topic);
@@ -682,8 +1013,11 @@ static void publish_uart_telemetry_to_mqtt(const char *line) {
         cJSON_DeleteItemFromObjectCaseSensitive(root, "type");
         char *payload = cJSON_PrintUnformatted(root);
         if (payload != NULL) {
-            esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 0);
-            ESP_LOGI(TAG, "Published telemetry to %s", topic);
+            if (s_mqtt != NULL) {
+                esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 0);
+                ESP_LOGI(TAG, "Published telemetry to %s", topic);
+            }
+            update_device_status(friendly_name->valuestring, payload);
             cJSON_free(payload);
         }
     } else if (strcmp(type->valuestring, "test_result") == 0 && cJSON_IsString(friendly_name) && friendly_name->valuestring != NULL) {
@@ -776,13 +1110,23 @@ void app_main(void) {
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+    s_status_mutex = xSemaphoreCreateMutex();
+    bool do_factory_reset = check_reboot_counter();
+    xTaskCreate(factory_reset_clear_task, "rst_clear", 2048, NULL, 3, NULL);
     uart_init();
     load_bridge_config();
+    if (do_factory_reset) {
+        remove(BRIDGE_CONFIG_PATH);
+        ESP_LOGW(TAG, "Factory reset: bridge_config.json deleted");
+        load_default_config();
+    }
+    /* uart_rx_task runs in both provisioning and normal modes */
+    xTaskCreate(uart_rx_task, "uart_rx_task", 6144, NULL, 5, NULL);
     if (!bridge_config_is_valid()) {
         provisioning_mode();
         return;
     }
     wifi_init_sta();
+    s_status_http = start_status_server();
     mqtt_start();
-    xTaskCreate(uart_rx_task, "uart_rx_task", 6144, NULL, 5, NULL);
 }
